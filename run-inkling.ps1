@@ -1,9 +1,9 @@
-﻿# Inkling-2-Mini Q8 su Strata (fork): serve con web UI locale. Default 32k di contesto.
+﻿# Inkling-2-Mini Q4 abliterated su Strata (fork): serve con web UI locale. Default 32k di contesto.
 # Uso:  .\run-inkling.ps1            -> http://127.0.0.1:8085
 #       .\run-inkling.ps1 -Context 65536 -Chunk 256
 #       .\run-inkling.ps1 -Bench     -> bench senza server (usa $TokensFile)
 param(
-  [string]$Model = "C:\models\inkling\Inkling-2-Mini-UD-Q8_K_XL.gguf",
+  [string]$Model = "C:\models\inkling\Inkling-2-Mini-UD-Q4_K_XL-Abliterated.gguf",
   [int]$MaxContext = 32768,
   [int]$Chunk = 512,
   [int]$Port = 8085,
@@ -28,7 +28,7 @@ if ($Bench) {
 }
 $cfg = [ordered]@{
   arch           = "inkling2"
-  model_name     = "Inkling-2-Mini-UD-Q8_K_XL"
+  model_name     = [IO.Path]::GetFileNameWithoutExtension($Model)
   exe            = $exe
   args           = @("--model",$Model,"--kv-q8","--max-context","$MaxContext","--chunk","$Chunk","--serve")
   tokenizer      = $TokenizerDir
@@ -40,3 +40,4 @@ $cfgPath = Join-Path $root "inkling-run.json"
 $cfg | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 $cfgPath
 "Inkling: contesto $MaxContext, chunk $Chunk -> http://127.0.0.1:$Port (attendi ~40 s)"
 & (Join-Path $root "terminal\bin\strata.cmd") serve --config $cfgPath --host 127.0.0.1 --port $Port
+
