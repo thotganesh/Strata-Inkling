@@ -794,7 +794,7 @@ struct Engine {
 
     // Hybrid CPU pool staging
     int32_t* h_ids = nullptr;        // [tmax * top_k]
-    float* h_h = nullptr;            // [tmax * N]
+    float* h_h = nullptr; int cpu_rows = 0;            // [tmax * N]
     float* cpu_out = nullptr;        // [tmax * top_k * N]
     int32_t* h_miss = nullptr;       // [tmax * top_k]
     int32_t* d_miss = nullptr;
@@ -1239,6 +1239,8 @@ struct Engine {
         DeviceScope owner(device);
         const int64_t N = m->hp.n_embd;
         const int64_t cpu_ent = (int64_t) cpu_t * m->hp.n_expert_used;
+        cpu_rows = cpu_t;
+        if (const char* v = std::getenv("STRATA_CPU_ROWS_TEST")) cpu_rows = std::max(1, std::min(cpu_t, std::atoi(v)));
         CK(cudaMallocHost(&h_h, (size_t) cpu_t * N * sizeof(float)));
         CK(cudaMallocHost(&cpu_out, (size_t) cpu_ent * N * sizeof(float)));
         CK(cudaMallocHost(&h_miss, (size_t) cpu_ent * sizeof(int32_t)));
@@ -1692,7 +1694,7 @@ struct Engine {
 
         if (need_cpu) {
             CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
-            CK(cudaMemcpyAsync(h_h, x_norm, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToHost, st));
+            CK(cudaMemcpyAsync(h_h, x_norm, (size_t) std::min(T, cpu_rows > 0 ? cpu_rows : T) * N * sizeof(float), cudaMemcpyDeviceToHost, st));
             CK(cudaEventRecord(ev_route, st));
         }
 
@@ -1715,6 +1717,17 @@ struct Engine {
 
 #if defined(STRATA_INKLING2_CPU_POOL)
         if (need_cpu) {
+            const int T_all = T;
+            const int cpu_step = cpu_rows > 0 ? cpu_rows : T_all;
+            for (int sb0 = 0; sb0 < T_all; sb0 += cpu_step) {
+            const int T = std::min(cpu_step, T_all - sb0);
+            const int n_ent = T * Kp;
+            int32_t* const h_ids = this->h_ids + (size_t) sb0 * Kp;
+            auto* const eparts = this->eparts + (size_t) sb0 * Kp * N;
+            if (sb0 > 0) {
+                CK(cudaMemcpyAsync(h_h, x_norm + (size_t) sb0 * N, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToHost, st));
+                CK(cudaEventRecord(ev_route, st));
+            }
             namespace C = strata::kernels::cpu;
             const auto tp_wait0 = Clock::now();
             while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
@@ -1797,6 +1810,8 @@ struct Engine {
                     CK(cudaMemcpyAsync(eparts, cpu_out, (size_t) n_ent * N * sizeof(float), cudaMemcpyHostToDevice, st));
                 }
                 if (prof) { CK(cudaStreamSynchronize(st)); p_moe_up_ms += ms_since(tp_u0); }
+            }
+        if (sb0 + cpu_step < T_all) CK(cudaStreamSynchronize(st));
             }
         } else {
             hy_gpu += n_ent;
