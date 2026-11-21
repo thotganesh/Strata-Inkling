@@ -1828,6 +1828,80 @@ struct Engine {
         if (prof && need_cpu) { CK(cudaStreamSynchronize(st)); p_moe_post_ms += ms_since(tp_p0); }
     }
 
+        void rebalance_bulk(int per_layer, int max_swaps) {
+        DeviceScope owner(device);
+        if (role == Role::Outer && split_peer) split_peer->rebalance_bulk(per_layer, max_swaps);
+        if (replica || !hybrid) return;
+        const int ne = (int) m->hp.n_expert;
+        struct BCand { double gain; size_t li; int slot; int hot_x; int cold_y; };
+        std::vector<BCand> cands;
+        std::vector<int> order((size_t) ne);
+        std::vector<int> victims;
+        for (size_t li = 0; li < m->layers.size(); ++li) {
+            if (!owns_phys((int) li)) continue;
+            PhysLayer& L = m->layers[li];
+            const int S = L.n_slots;
+            if (S <= 0 || S >= ne) continue;
+            const double weight = (L.L.gu_type == 13) ? 1.43 : 1.0;
+            for (int x = 0; x < ne; ++x) order[(size_t) x] = x;
+            std::sort(order.begin(), order.end(), [&](int a, int b) { return L.score[(size_t) a] > L.score[(size_t) b]; });
+            victims.resize((size_t) S);
+            for (int s = 0; s < S; ++s) victims[(size_t) s] = s;
+            std::sort(victims.begin(), victims.end(), [&](int a, int b) {
+                return L.score[(size_t) L.exp_in_slot[(size_t) a]] < L.score[(size_t) L.exp_in_slot[(size_t) b]];
+            });
+            int vi = 0, n = 0;
+            for (int i = 0; i < ne && vi < S && n < per_layer; ++i) {
+                const int x = order[(size_t) i];
+                if (L.slot_of[(size_t) x] >= 0) continue;
+                const int s = victims[(size_t) vi];
+                const int y = L.exp_in_slot[(size_t) s];
+                const double diff = L.score[(size_t) x] - L.score[(size_t) y];
+                if (diff <= 0.0) break;
+                cands.push_back(BCand{diff * weight, li, s, x, y});
+                ++vi; ++n;
+            }
+            for (int x = 0; x < ne; ++x) L.score[(size_t) x] *= 0.8;
+        }
+        const bool log_on = std::getenv("STRATA_REBAL_LOG") != nullptr;
+        if (cands.empty()) {
+            if (log_on) std::fprintf(stderr, "strata-inkling2: rebalance_bulk: 0 candidati\n");
+            return;
+        }
+        std::sort(cands.begin(), cands.end(), [](const BCand& a, const BCand& b) { return a.gain > b.gain; });
+        const int take = std::min<int>(max_swaps, (int) cands.size());
+        if (log_on) std::fprintf(stderr, "strata-inkling2: rebalance_bulk: candidati=%d eseguiti=%d gain_max=%.1f\n", (int) cands.size(), take, cands[0].gain);
+        std::vector<char> touched(m->layers.size(), 0);
+        for (int i = 0; i < take; ++i) {
+            const BCand& c = cands[(size_t) i];
+            PhysLayer& L = m->layers[c.li];
+            L.slot_of[(size_t) c.cold_y] = -1;
+            L.slot_of[(size_t) c.hot_x] = c.slot;
+            L.exp_in_slot[(size_t) c.slot] = c.hot_x;
+            CK(cudaMemcpyAsync(L.d_blobs + (size_t) c.slot * L.stride, L.hblobs + (size_t) c.hot_x * L.stride,
+                               L.L.bytes, cudaMemcpyHostToDevice, cst));
+            touched[c.li] = 1;
+        }
+        for (size_t li = 0; li < m->layers.size(); ++li) {
+            if (!touched[li]) continue;
+            PhysLayer& L = m->layers[li];
+            CK(cudaMemcpyAsync(L.d_slot_of, L.slot_of.data(), (size_t) ne * sizeof(int32_t), cudaMemcpyHostToDevice, cst));
+        }
+        CK(cudaEventRecord(ev_rebal, cst));
+        has_pending_rebal = true;
+    }
+    void rb_after_prefill() {
+        static const int bulk_pl = [] { const char* v = std::getenv("STRATA_REBAL_BULK_PER_LAYER"); return v ? std::max(0, std::atoi(v)) : 0; }();
+        static const int bulk_sw = [] { const char* v = std::getenv("STRATA_REBAL_BULK_SWAPS"); return v ? std::max(1, std::atoi(v)) : 400; }();
+        if (std::getenv("STRATA_REBAL_LOG")) std::fprintf(stderr, "strata-inkling2: rb_after_prefill (bulk_pl=%d)\n", bulk_pl);
+        if (bulk_pl > 0) rebalance_bulk(bulk_pl, bulk_sw); else rebalance(8);
+    }
+    void rb_periodic() {
+        static const int rb_per = [] { const char* v = std::getenv("STRATA_REBAL_PER_LAYER"); return v ? std::max(1, std::atoi(v)) : 1; }();
+        static const int rb_swaps = [] { const char* v = std::getenv("STRATA_REBAL_SWAPS"); return v ? std::max(1, std::atoi(v)) : 0; }();
+        const int sw = rb_swaps > 0 ? rb_swaps : (core_all_gpu ? 4 : 6);
+        if (rb_per > 1) rebalance_bulk(rb_per, sw); else rebalance(sw);
+    }
     void rebalance(int max_swaps) {
         DeviceScope owner(device);
         if (role == Role::Outer && split_peer) split_peer->rebalance(max_swaps);
@@ -2843,6 +2917,11 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
         if (sample_on) next_tok = sample_logits(lg, hist, smp, rng);
     };
 
+    if (E.any_hybrid()) {
+        static const int bulk_pl = [] { const char* v = std::getenv("STRATA_REBAL_BULK_PER_LAYER"); return v ? std::max(0, std::atoi(v)) : 0; }();
+        static const int bulk_sw = [] { const char* v = std::getenv("STRATA_REBAL_BULK_SWAPS"); return v ? std::max(1, std::atoi(v)) : 400; }();
+        if (bulk_pl > 0) E.rebalance_bulk(bulk_pl, bulk_sw);
+    }
     while (emitted < limit && !is_stopped()) {
         if (!on_emit(next_tok)) {
             if (out_hit_eos) *out_hit_eos = true;
@@ -2855,7 +2934,11 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
 
         if (!dspark || rem < 2 || draft_max < 1) {
             feed_single(next_tok);
-            if (E.any_hybrid() && (emitted % 8 == 0)) E.rebalance(E.core_all_gpu ? 4 : 6);
+            {
+    static const int rb_every = [] { const char* v = std::getenv("STRATA_REBAL_EVERY"); return v ? std::max(1, std::atoi(v)) : 8; }();
+    static const int rb_swaps = [] { const char* v = std::getenv("STRATA_REBAL_SWAPS"); return v ? std::max(1, std::atoi(v)) : 0; }();
+    if (E.any_hybrid() && (emitted % rb_every == 0)) { static const int rb_per = [] { const char* v = std::getenv("STRATA_REBAL_PER_LAYER"); return v ? std::max(1, std::atoi(v)) : 1; }(); const int sw = rb_swaps > 0 ? rb_swaps : (E.core_all_gpu ? 4 : 6); if (rb_per > 1) E.rebalance_bulk(rb_per, sw); else E.rebalance(sw); }
+}
             continue;
         }
 
@@ -2929,7 +3012,7 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
             if (out_hit_eos) *out_hit_eos = true;
             break;
         }
-        if (E.any_hybrid() && (emitted % 8 < (1 + m))) E.rebalance(E.core_all_gpu ? 4 : 6);
+        if (E.any_hybrid() && (emitted % 8 < (1 + m))) E.rb_periodic();
     }
 }
 
@@ -3382,7 +3465,7 @@ int run(int argc, char** argv) {
                     next_tok = E.forward(prompt.data() + off, tc, is_last && sample_on, &lg, false, dspark != nullptr);
                     if (dspark) dspark->inject(E, p0, tc);
                     live_tokens.insert(live_tokens.end(), prompt.begin() + (ptrdiff_t) off, prompt.begin() + (ptrdiff_t) (off + (size_t) tc));
-                    if (E.any_hybrid()) E.rebalance(8);
+                    if (E.any_hybrid()) E.rb_after_prefill();
                     const double el_ms = ms_since(t_pp0);
                     const double done_fresh = (double) (off + (size_t) tc - reuse);
                     const double pp_tps_now = done_fresh / std::max(1e-6, el_ms / 1000.0);
@@ -3443,7 +3526,7 @@ int run(int argc, char** argv) {
                             next_tok = E.forward(&fed, 1, sample_on, &lg);
                             live_tokens.push_back(fed);
                             if (sample_on) next_tok = sample_logits(lg, hist, smp, rng);
-                            if (E.any_hybrid() && (step % 8 == 7)) E.rebalance(E.core_all_gpu ? 4 : 6);
+                            if (E.any_hybrid() && (step % 8 == 7)) E.rb_periodic();
                         }
                     }
                 }
@@ -3493,7 +3576,7 @@ int run(int argc, char** argv) {
         next_tok = E.forward(prompt.data() + off, tc, is_last && !dump_logits_path.empty(), &dumped, false, dspark != nullptr);
         if (dspark) dspark->inject(E, p0, tc);
         const auto tr0 = Clock::now();
-        if (E.any_hybrid()) E.rebalance(8);
+        if (E.any_hybrid()) E.rb_after_prefill();
         if (profile) { CK(cudaStreamSynchronize(E.st)); E.p_rebal_ms += ms_since(tr0); }
     }
     const double pp_ms = ms_since(t_pp0);
@@ -3524,7 +3607,7 @@ int run(int argc, char** argv) {
             next_tok = E.forward(&next_tok, 1);
             gen.push_back(next_tok);
             const auto tr0 = Clock::now();
-            if (E.any_hybrid() && (step % 8 == 0)) E.rebalance(E.core_all_gpu ? 4 : 6);
+            if (E.any_hybrid() && (step % 8 == 0)) E.rb_periodic();
             if (profile) { CK(cudaStreamSynchronize(E.st)); E.p_rebal_ms += ms_since(tr0); }
         }
     }
